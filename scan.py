@@ -16,6 +16,7 @@
 import copy
 import json
 import os
+import signal
 from urllib.parse import unquote_plus
 from distutils.util import strtobool
 
@@ -41,38 +42,46 @@ from common import create_dir
 from common import get_timestamp
 
 
+clamd_pid = None
+
+
 def event_object(event, event_source="s3"):
 
     # SNS events are slightly different
-    if event_source.upper() == "SNS":
-        event = json.loads(event["Records"][0]["Sns"]["Message"])
+    # if event_source.upper() == "SNS":
+    #     event = json.loads(event["Records"][0]["Sns"]["Message"])
 
-    # Break down the record
-    records = event["Records"]
-    if len(records) == 0:
-        raise Exception("No records found in event!")
-    record = records[0]
+    # # Break down the record
+    # records = event["Records"]
+    # if len(records) == 0:
+    #     raise Exception("No records found in event!")
+    # record = records[0]
 
-    s3_obj = record["s3"]
+    # s3_obj = record["s3"]
 
-    # Get the bucket name
-    if "bucket" not in s3_obj:
-        raise Exception("No bucket found in event!")
-    bucket_name = s3_obj["bucket"].get("name", None)
+    # # Get the bucket name
+    # if "bucket" not in s3_obj:
+    #     raise Exception("No bucket found in event!")
+    # bucket_name = s3_obj["bucket"].get("name", None)
 
-    # Get the key name
-    if "object" not in s3_obj:
-        raise Exception("No key found in event!")
-    key_name = s3_obj["object"].get("key", None)
+    # # Get the key name
+    # if "object" not in s3_obj:
+    #     raise Exception("No key found in event!")
+    # key_name = s3_obj["object"].get("key", None)
 
-    if key_name:
-        key_name = unquote_plus(key_name)
+    # if key_name:
+    #     key_name = unquote_plus(key_name)
 
-    # Ensure both bucket and key exist
-    if (not bucket_name) or (not key_name):
-        raise Exception("Unable to retrieve object from event.\n{}".format(event))
+    # # Ensure both bucket and key exist
+    # if (not bucket_name) or (not key_name):
+    #     raise Exception("Unable to retrieve object from event.\n{}".format(event))
 
-    # Create and return the object
+    # # Create and return the object
+    # s3 = boto3.resource("s3")
+
+    event = json.loads(event["Records"][0]["body"])
+    bucket_name = event["Records"][0]["s3"]["bucket"]["name"]
+    key_name = event["Records"][0]["s3"]["object"]["key"]
     s3 = boto3.resource("s3")
     return s3.Object(bucket_name, key_name)
 
@@ -184,21 +193,45 @@ def sns_scan_results(
         AV_STATUS_METADATA: scan_result,
         AV_TIMESTAMP_METADATA: get_timestamp(),
     }
-    sns_client.publish(
-        TargetArn=sns_arn,
-        Message=json.dumps({"default": json.dumps(message)}),
-        MessageStructure="json",
-        MessageAttributes={
-            AV_STATUS_METADATA: {"DataType": "String", "StringValue": scan_result},
-            AV_SIGNATURE_METADATA: {
-                "DataType": "String",
-                "StringValue": scan_signature,
-            },
-        },
+    # sns_client.publish(
+    #     TargetArn=sns_arn,
+    #     Message=json.dumps({"default": json.dumps(message)}),
+    #     MessageStructure="json",
+    #     MessageAttributes={
+    #         AV_STATUS_METADATA: {"DataType": "String", "StringValue": scan_result},
+    #         AV_SIGNATURE_METADATA: {
+    #             "DataType": "String",
+    #             "StringValue": scan_signature,
+    #         },
+    #     },
+    # )
+
+    sqs = boto3.client("sqs")
+    sqs.send_message(
+        QueueUrl=sns_arn,
+        MessageAttributes={},
+        MessageBody=(json.dumps(message))
     )
 
 
+def kill_process_by_pid(pid):
+    # Check if process is running on PID
+    try:
+        os.kill(clamd_pid, 0)
+    except OSError:
+        return
+
+    print("Killing the process by PID %s" % clamd_pid)
+
+    try:
+        os.kill(clamd_pid, signal.SIGTERM)
+    except OSError:
+        os.kill(clamd_pid, signal.SIGKILL)
+
+
 def lambda_handler(event, context):
+    global clamd_pid
+
     s3 = boto3.resource("s3")
     s3_client = boto3.client("s3")
     sns_client = boto3.client("sns")
@@ -206,6 +239,13 @@ def lambda_handler(event, context):
     # Get some environment variables
     ENV = os.getenv("ENV", "")
     EVENT_SOURCE = os.getenv("EVENT_SOURCE", "S3")
+
+    if not clamav.is_clamd_running():
+        if clamd_pid is not None:
+            kill_process_by_pid(clamd_pid)
+
+        clamd_pid = clamav.start_clamd_daemon()
+        print("Clamd PID: %s" % clamd_pid)
 
     start_time = get_timestamp()
     print("Script starting at %s\n" % (start_time))
@@ -223,16 +263,6 @@ def lambda_handler(event, context):
     create_dir(os.path.dirname(file_path))
     s3_object.download_file(file_path)
 
-    to_download = clamav.update_defs_from_s3(
-        s3_client, AV_DEFINITION_S3_BUCKET, AV_DEFINITION_S3_PREFIX
-    )
-
-    for download in to_download.values():
-        s3_path = download["s3_path"]
-        local_path = download["local_path"]
-        print("Downloading definition file %s from s3://%s" % (local_path, s3_path))
-        s3.Bucket(AV_DEFINITION_S3_BUCKET).download_file(s3_path, local_path)
-        print("Downloading definition file %s complete!" % (local_path))
     scan_result, scan_signature = clamav.scan_file(file_path)
     print(
         "Scan of s3://%s resulted in %s\n"
